@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__, jobstore
+from .api.routes import jobs as jobs_routes
 from .config import get_config
 
 
@@ -40,6 +41,8 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "healthy"}
+
+    app.include_router(jobs_routes.router)
 
     return app
 
