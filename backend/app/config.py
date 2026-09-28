@@ -17,8 +17,8 @@ _config_override: "Config | None" = None
 
 LOCAL_OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
-# Real, currently-available default. (The reference used a fictional
-# ``gemini-3-flash-preview`` id -- do NOT use that.)
+# Real, currently-available default Gemini id (env ``LLM`` overrides it). The
+# reference project shipped placeholder model ids that are not used here.
 DEFAULT_LLM = "google-gla:gemini-1.5-flash"
 
 
