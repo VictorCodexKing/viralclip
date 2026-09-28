@@ -1,4 +1,6 @@
 import asyncio
+import importlib
+import sqlite3
 
 import pytest
 
@@ -126,3 +128,110 @@ async def test_pubsub_error_event(store):
         await store.unsubscribe(job.id, queue)
     assert event["status"] == store.STATUS_ERROR
     assert event["error"] == "kaboom"
+
+
+def _clip_columns(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(clips)").fetchall()}
+    finally:
+        conn.close()
+
+
+def test_init_store_migrates_pre_export_path_db(tmp_path):
+    """A DB created before `export_path` existed must gain the column and read
+    cleanly after ``init_store`` runs its guarded additive migration."""
+    import app.jobstore as jobstore
+
+    importlib.reload(jobstore)
+
+    db_path = tmp_path / "pre_migration.db"
+
+    # Simulate a pre-migration database: a `clips` table that predates the
+    # `export_path` column, with one existing clip row and a parent job.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                source_url TEXT,
+                source_type TEXT,
+                status TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                progress_message TEXT,
+                error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                options TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE clips (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                filename TEXT,
+                file_path TEXT,
+                start_time REAL,
+                end_time REAL,
+                duration REAL,
+                text TEXT,
+                relevance_score REAL,
+                reasoning TEXT,
+                virality_score REAL,
+                hook_score REAL,
+                engagement_score REAL,
+                value_score REAL,
+                shareability_score REAL,
+                hook_type TEXT,
+                hook_title TEXT,
+                clip_order INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO jobs (id, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("job-old", jobstore.STATUS_COMPLETED, 0.0, 0.0),
+        )
+        conn.execute(
+            "INSERT INTO clips (id, job_id, filename, clip_order) VALUES (?, ?, ?, ?)",
+            ("clip-old", "job-old", "old.mp4", 0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Precondition: the column really is missing.
+    assert "export_path" not in _clip_columns(db_path)
+
+    jobstore.init_store(db_path)
+
+    # The guarded migration must have added the column.
+    assert "export_path" in _clip_columns(db_path)
+
+    # The pre-existing row must read cleanly, with export_path defaulting to None.
+    clip = jobstore.get_clip("clip-old")
+    assert clip is not None
+    assert clip.filename == "old.mp4"
+    assert clip.export_path is None
+
+
+def test_init_store_migration_is_idempotent(tmp_path):
+    """Re-running ``init_store`` must not error or duplicate the column."""
+    import app.jobstore as jobstore
+
+    importlib.reload(jobstore)
+
+    db_path = tmp_path / "idempotent.db"
+
+    jobstore.init_store(db_path)
+    columns_after_first = _clip_columns(db_path)
+    assert list(columns_after_first).count("export_path") == 1
+
+    # Calling again must be a no-op migration: no error, exactly one column.
+    jobstore.init_store(db_path)
+    columns_after_second = _clip_columns(db_path)
+    assert columns_after_second == columns_after_first
+    assert list(columns_after_second).count("export_path") == 1

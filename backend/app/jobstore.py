@@ -138,6 +138,17 @@ def init_store(db_path: str | Path | None = None) -> None:
             """
         )
 
+        # Additive migration for databases created before `export_path`
+        # existed. `CREATE TABLE IF NOT EXISTS` will not add the column to an
+        # already-present table, so upgrade-over-existing-DB would otherwise
+        # break clip reads. Guard with a column-existence check.
+        existing_clip_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(clips)").fetchall()
+        }
+        if "export_path" not in existing_clip_columns:
+            conn.execute("ALTER TABLE clips ADD COLUMN export_path TEXT")
+
 
 # --- Row mapping --------------------------------------------------------------
 
