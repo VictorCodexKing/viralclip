@@ -47,7 +47,8 @@ def _run(command: List[str]) -> None:
     subprocess.run(command, check=True, capture_output=True, text=True)
 
 
-def _ffprobe_duration(path: Path) -> float:
+def ffprobe_duration(path: Path) -> float:
+    """Return the duration (seconds) of a media file via ``ffprobe``."""
     result = subprocess.run(
         [
             "ffprobe",
@@ -64,6 +65,10 @@ def _ffprobe_duration(path: Path) -> float:
         text=True,
     )
     return max(0.0, float(result.stdout.strip()))
+
+
+# Backwards-compatible private alias used internally.
+_ffprobe_duration = ffprobe_duration
 
 
 def _double_bitrate(value: str) -> str:

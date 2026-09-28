@@ -34,6 +34,7 @@ export interface Clip {
   hook_type: string | null;
   hook_title: string | null;
   clip_order: number;
+  export_path: string | null;
 }
 
 export interface Job {
@@ -190,6 +191,11 @@ export function clipFileUrl(
 ): string {
   const base = `${API_URL}/api/jobs/${jobId}/clips/${clipId}/file`;
   return download ? `${base}?download=1` : base;
+}
+
+/** Absolute URL for a path the API returned relative to its own origin. */
+export function apiUrl(path: string): string {
+  return path.startsWith("http") ? path : `${API_URL}${path}`;
 }
 
 // --- Editor: trim / split / merge / export -----------------------------------

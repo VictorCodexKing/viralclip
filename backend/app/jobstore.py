@@ -60,6 +60,7 @@ class Clip:
     hook_type: str | None = None
     hook_title: str | None = None
     clip_order: int = 0
+    export_path: str | None = None
 
 
 @dataclass
@@ -129,6 +130,7 @@ def init_store(db_path: str | Path | None = None) -> None:
                 hook_type TEXT,
                 hook_title TEXT,
                 clip_order INTEGER NOT NULL DEFAULT 0,
+                export_path TEXT,
                 FOREIGN KEY (job_id) REFERENCES jobs (id) ON DELETE CASCADE
             );
 
@@ -175,6 +177,7 @@ def _row_to_clip(row: sqlite3.Row) -> Clip:
         hook_type=row["hook_type"],
         hook_title=row["hook_title"],
         clip_order=row["clip_order"],
+        export_path=row["export_path"],
     )
 
 
@@ -326,6 +329,7 @@ def add_clip(
     hook_type: str | None = None,
     hook_title: str | None = None,
     clip_order: int = 0,
+    export_path: str | None = None,
     clip_id: str | None = None,
 ) -> Clip:
     clip = Clip(
@@ -347,6 +351,7 @@ def add_clip(
         hook_type=hook_type,
         hook_title=hook_title,
         clip_order=clip_order,
+        export_path=export_path,
     )
     with _connect() as conn:
         conn.execute(
@@ -355,8 +360,8 @@ def add_clip(
                 id, job_id, filename, file_path, start_time, end_time, duration,
                 text, relevance_score, reasoning, virality_score, hook_score,
                 engagement_score, value_score, shareability_score, hook_type,
-                hook_title, clip_order
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                hook_title, clip_order, export_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 clip.id,
@@ -377,6 +382,7 @@ def add_clip(
                 clip.hook_type,
                 clip.hook_title,
                 clip.clip_order,
+                clip.export_path,
             ),
         )
     return clip
@@ -415,6 +421,7 @@ _UPDATABLE_CLIP_FIELDS = {
     "hook_type",
     "hook_title",
     "clip_order",
+    "export_path",
 }
 
 

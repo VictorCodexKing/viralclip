@@ -40,6 +40,7 @@ from sse_starlette.sse import EventSourceResponse
 from ... import caption_templates, font_registry, jobstore, pipeline
 from ...clip_editor import (
     EXPORT_PRESETS,
+    ffprobe_duration,
     export_with_preset,
     merge_clip_files,
     split_clip_file,
@@ -407,11 +408,22 @@ async def trim_clip(job_id: str, clip_id: str, request: Request):
         end_offset,
     )
 
-    updated = jobstore.update_clip(
-        clip_id,
-        file_path=str(new_path),
-        filename=new_path.name,
-    )
+    # Recompute the duration of the regenerated file and shift the clip's
+    # start/end bounds so the editor sliders and split guard use the new length.
+    new_duration = await loop.run_in_executor(None, ffprobe_duration, new_path)
+    fields: dict[str, Any] = {
+        "file_path": str(new_path),
+        "filename": new_path.name,
+        "duration": new_duration,
+    }
+    if clip.start_time is not None:
+        fields["start_time"] = clip.start_time + start_offset
+        fields["end_time"] = clip.start_time + start_offset + new_duration
+    else:
+        fields["start_time"] = 0.0
+        fields["end_time"] = new_duration
+
+    updated = jobstore.update_clip(clip_id, **fields)
     return {"clip": _clip_to_dict(updated)}
 
 
@@ -441,14 +453,38 @@ async def split_clip(job_id: str, clip_id: str, request: Request):
         split_time,
     )
 
+    first_duration = await loop.run_in_executor(None, ffprobe_duration, first_path)
+    second_duration = await loop.run_in_executor(None, ffprobe_duration, second_path)
+
+    base_start = clip.start_time or 0.0
+
     first = jobstore.update_clip(
-        clip_id, file_path=str(first_path), filename=first_path.name
+        clip_id,
+        file_path=str(first_path),
+        filename=first_path.name,
+        duration=first_duration,
+        start_time=base_start,
+        end_time=base_start + first_duration,
     )
+    # The two halves inherit the parent clip's virality scores and metadata so
+    # their cards still render a score bar rather than an empty placeholder.
     second = jobstore.add_clip(
         job_id=job_id,
         filename=second_path.name,
         file_path=str(second_path),
+        start_time=base_start + first_duration,
+        end_time=base_start + first_duration + second_duration,
+        duration=second_duration,
         text=clip.text,
+        relevance_score=clip.relevance_score,
+        reasoning=clip.reasoning,
+        virality_score=clip.virality_score,
+        hook_score=clip.hook_score,
+        engagement_score=clip.engagement_score,
+        value_score=clip.value_score,
+        shareability_score=clip.shareability_score,
+        hook_type=clip.hook_type,
+        hook_title=clip.hook_title,
         clip_order=clip.clip_order + 1,
     )
     return {"clips": [_clip_to_dict(first), _clip_to_dict(second)]}
@@ -470,6 +506,7 @@ async def merge_clips(job_id: str, request: Request):
         )
 
     paths: list[Path] = []
+    source_clips: list[jobstore.Clip] = []
     for cid in clip_ids:
         clip = _get_clip_or_404(job_id, cid)
         if not clip.file_path or not Path(clip.file_path).exists():
@@ -477,16 +514,38 @@ async def merge_clips(job_id: str, request: Request):
                 status_code=404, detail=f"Clip file not found: {cid}"
             )
         paths.append(Path(clip.file_path))
+        source_clips.append(clip)
 
     loop = asyncio.get_event_loop()
     merged_path = await loop.run_in_executor(
         None, merge_clip_files, paths, _outputs_dir()
     )
 
+    merged_duration = await loop.run_in_executor(None, ffprobe_duration, merged_path)
+
+    # The merged clip inherits scores/metadata from the strongest source clip
+    # so its card shows a score bar rather than an empty placeholder.
+    best = max(
+        source_clips,
+        key=lambda c: c.virality_score if c.virality_score is not None else -1.0,
+    )
     merged = jobstore.add_clip(
         job_id=job_id,
         filename=merged_path.name,
         file_path=str(merged_path),
+        start_time=0.0,
+        end_time=merged_duration,
+        duration=merged_duration,
+        text=best.text,
+        relevance_score=best.relevance_score,
+        reasoning=best.reasoning,
+        virality_score=best.virality_score,
+        hook_score=best.hook_score,
+        engagement_score=best.engagement_score,
+        value_score=best.value_score,
+        shareability_score=best.shareability_score,
+        hook_type=best.hook_type,
+        hook_title=best.hook_title,
         clip_order=9999,
     )
     return {"clip": _clip_to_dict(merged)}
@@ -518,12 +577,35 @@ async def export_clip(job_id: str, clip_id: str, request: Request):
         preset_name,
     )
 
+    # Persist the export path on the clip so the dedicated export download
+    # route can serve the preset-encoded artifact (not the original clip).
+    jobstore.update_clip(clip_id, export_path=str(output_path))
+
     return {
         "preset": preset_name,
         "path": str(output_path),
         "filename": output_path.name,
-        "url": f"/api/jobs/{job_id}/clips/{clip_id}/file?download=1",
+        "url": f"/api/jobs/{job_id}/clips/{clip_id}/export/file",
     }
+
+
+@router.get("/jobs/{job_id}/clips/{clip_id}/export/file")
+async def get_clip_export_file(job_id: str, clip_id: str):
+    """Serve the most recent preset-encoded export for a clip as a download."""
+    clip = _get_clip_or_404(job_id, clip_id)
+    if not clip.export_path:
+        raise HTTPException(status_code=404, detail="No export available for clip")
+    export_path = Path(clip.export_path)
+    if not export_path.exists():
+        raise HTTPException(status_code=404, detail="Export file not found")
+
+    return FileResponse(
+        path=str(export_path),
+        media_type="video/mp4",
+        filename=export_path.name,
+        content_disposition_type="attachment",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # --- Selector metadata --------------------------------------------------------

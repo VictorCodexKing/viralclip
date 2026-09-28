@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import {
+  apiUrl,
   clipFileUrl,
   exportClip,
   splitClip,
@@ -105,9 +106,10 @@ export function ClipCard({
     try {
       const result = await exportClip(jobId, clip.id, preset);
       toast.success(`Exported for ${preset}. Downloading…`);
-      // The export endpoint returns a download URL relative to the API.
+      // The export endpoint returns a download URL (relative to the API)
+      // that serves the preset-encoded artifact, not the original clip.
       const link = document.createElement("a");
-      link.href = clipFileUrl(jobId, clip.id, true);
+      link.href = apiUrl(result.url);
       link.download = result.filename;
       document.body.appendChild(link);
       link.click();
