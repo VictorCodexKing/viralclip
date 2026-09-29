@@ -9,6 +9,7 @@ without a real API call.
 from __future__ import annotations
 
 import pytest
+from pydantic_ai.exceptions import ModelHTTPError
 
 from app import ai
 from app.ai import (
@@ -82,7 +83,7 @@ def test_sanitize_hook_title_empty_returns_none():
 
 
 def test_repair_expands_too_short_segment():
-    # 5s span (00:00-00:05) is under the 15s minimum -> should expand.
+    # 5s span is under the 10s minimum -> should expand.
     repaired = _choose_repaired_bounds(_spans(), 0, 5)
     assert repaired is not None
     start, end = repaired
@@ -91,7 +92,7 @@ def test_repair_expands_too_short_segment():
 
 
 def test_repair_trims_too_long_segment():
-    # 75s span exceeds the 60s max -> should trim toward the ideal max.
+    # 75s span exceeds the 30s max -> should trim toward the ideal max.
     repaired = _choose_repaired_bounds(_spans(), 0, 75)
     assert repaired is not None
     start, end = repaired
@@ -156,6 +157,36 @@ class _FakeAgent:
         return _FakeResult(self._output)
 
 
+async def test_real_agent_constructor_and_structured_output(monkeypatch):
+    """Exercise the installed Pydantic AI, rather than mocking its constructor."""
+    from pydantic_ai.models.test import TestModel
+    from app.config import Config
+
+    cfg = Config()
+    cfg.google_api_key = "test-key"
+    cfg.llm = "google-gla:gemini-2.5-flash"
+    model = TestModel(custom_output_args={
+        "most_relevant_segments": [{"start_time": "00:00", "end_time": "00:20", "text": "Line 0 has enough words to pass validation here."}],
+        "summary": "A test video.",
+        "key_topics": ["testing"],
+    })
+    monkeypatch.setattr(ai, "get_config", lambda: cfg)
+    monkeypatch.setattr(ai, "_build_transcript_model", lambda _: model)
+    monkeypatch.setattr(ai, "_transcript_agent", None)
+    monkeypatch.setattr(ai, "_transcript_agent_signature", None)
+    result = await get_most_relevant_parts_by_transcript(TRANSCRIPT)
+    assert len(result.most_relevant_segments) == 1
+    assert result.most_relevant_segments[0].end_time == "00:20"
+
+
+@pytest.mark.parametrize("end", ["00:10", "00:30"])
+def test_requested_clip_duration_boundaries_are_accepted(end):
+    segment = TranscriptSegment(start_time="00:00", end_time=end, text="A useful complete moment.")
+    result = ai._validate_segments([segment], TRANSCRIPT)
+    assert len(result) == 1
+    assert result[0].end_time == end
+
+
 async def test_ai_selection_repairs_and_validates_via_mocked_agent(monkeypatch):
     """A too-short segment from the model gets repaired; the hook title sanitized.
 
@@ -211,3 +242,37 @@ async def test_ai_selection_drops_invalid_duration_segment(monkeypatch):
     monkeypatch.setattr(ai, "get_transcript_agent", lambda: _FakeAgent(raw))
     result = await get_most_relevant_parts_by_transcript(TRANSCRIPT)
     assert result.most_relevant_segments == []
+
+
+@pytest.mark.parametrize("status,failures,expected_calls,expected_delays", [
+    (503, 2, 3, [2, 4]),
+    (503, 4, 4, [2, 4, 8]),
+    (404, 1, 1, []),
+])
+async def test_analysis_retries_only_transient_failures(
+    monkeypatch, status, failures, expected_calls, expected_delays,
+):
+    raw = TranscriptAnalysis(most_relevant_segments=[], summary="s", key_topics=[])
+    calls = 0
+    delays = []
+
+    class IntermittentAgent(_FakeAgent):
+        async def run(self, prompt):
+            nonlocal calls
+            calls += 1
+            if calls <= failures:
+                raise ModelHTTPError(status_code=status, model_name="test", body={})
+            return await super().run(prompt)
+
+    async def no_wait(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(ai, "get_transcript_agent", lambda: IntermittentAgent(raw))
+    monkeypatch.setattr(ai.asyncio, "sleep", no_wait)
+    if status == 404 or failures >= 4:
+        with pytest.raises(RuntimeError, match="Transcript analysis failed"):
+            await get_most_relevant_parts_by_transcript(TRANSCRIPT)
+    else:
+        assert (await get_most_relevant_parts_by_transcript(TRANSCRIPT)).summary == "s"
+    assert calls == expected_calls
+    assert delays == expected_delays

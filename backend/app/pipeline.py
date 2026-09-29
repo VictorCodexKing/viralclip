@@ -4,17 +4,18 @@ Adapted from the reference ``video_service.process_video_complete`` staging.
 Turns a YouTube URL (or a local uploaded video) into vertical 9:16 clips:
 
     10%  download / locate source
-    30%  transcribe (local Whisper by default)
+    30%  transcribe (AssemblyAI word timings by default)
     50%  AI clip selection + virality scoring + hook titles
     70%  render each selected segment:
-           reframe to 9:16 (face-centered) -> burn word-synced subtitles +
-           hook title -> optional Pexels B-roll -> write mp4 to data/outputs
+           MoviePy trims and reframes to 9:16 with optional fades ->
+           optional Pexels B-roll -> word-synced subtitles + hook title ->
+           write mp4 to data/outputs
    100%  complete
 
 Progress is pushed through ``jobstore.update_job_progress`` (which fans out to
 the SSE pub/sub), and each rendered clip is persisted via ``jobstore.add_clip``
 with its full virality fields, hook title, and clip order. All blocking work
-(ffmpeg / Whisper / OpenCV) runs in a thread executor so the event loop stays
+(MoviePy / ffmpeg / transcription / OpenCV) runs in a thread executor so the event loop stays
 responsive; on error the job is marked failed via ``jobstore.set_job_error``.
 """
 
@@ -27,16 +28,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import jobstore
-from .ai import get_most_relevant_parts_by_transcript
+from .ai import MAX_ACCEPTED_CLIP_SECONDS, get_most_relevant_parts_by_transcript
 from .config import get_config
 from .media.broll import fetch_broll_for_opportunities, overlay_broll
 from .media.captions import build_ass_subtitles
 from .media.ffmpeg import (
     burn_ass_subtitles_ffmpeg,
-    extract_clip,
     ffprobe_video_size,
 )
-from .media.reframing import reframe_to_vertical
+from .media.moviepy_render import render_video_clip
 from .media.timeline import (
     extend_keep_ranges_to_sentence_boundary,
     parse_timestamp_to_seconds,
@@ -102,6 +102,7 @@ def _render_clip_sync(
     output_dir: Path,
     temp_dir: Path,
     options: Dict[str, Any],
+    broll_suggestions: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Render one segment into a finished vertical mp4 (blocking work)."""
     start_seconds = parse_timestamp_to_seconds(segment["start_time"])
@@ -115,10 +116,9 @@ def _render_clip_sync(
     )
     if keep_ranges:
         start_seconds = keep_ranges[0][0]
-        end_seconds = keep_ranges[-1][1]
+        end_seconds = min(keep_ranges[-1][1], start_seconds + MAX_ACCEPTED_CLIP_SECONDS)
 
     suffix = uuid.uuid4().hex[:8]
-    trimmed_path = temp_dir / f"trim_{clip_index + 1}_{suffix}.mp4"
     vertical_path = temp_dir / f"vertical_{clip_index + 1}_{suffix}.mp4"
     filename = (
         f"clip_{clip_index + 1}_"
@@ -127,26 +127,43 @@ def _render_clip_sync(
     )
     output_path = output_dir / filename
 
-    # 1) Trim the source range.
-    if not extract_clip(video_path, start_seconds, end_seconds, trimmed_path):
-        logger.error("Failed to trim clip %d", clip_index + 1)
+    # 1) MoviePy trims, reframes, and applies the selected transition.
+    try:
+        start_seconds, end_seconds = render_video_clip(
+            video_path,
+            vertical_path,
+            start_seconds,
+            end_seconds,
+            vertical=options.get("output_format", "vertical") == "vertical",
+            transition=options.get("transition", "none"),
+        )
+    except Exception:
+        logger.exception("Failed to render clip %d", clip_index + 1)
         return None
-
-    # 2) Reframe to face-centered 9:16 (falls back to center crop).
-    if options.get("output_format", "vertical") == "vertical":
-        if not reframe_to_vertical(trimmed_path, vertical_path, 0.0, end_seconds - start_seconds):
-            logger.warning("Reframe failed for clip %d; using trimmed source", clip_index + 1)
-            vertical_path = trimmed_path
-    else:
-        vertical_path = trimmed_path
 
     try:
         video_width, video_height = ffprobe_video_size(vertical_path)
     except Exception:
         video_width, video_height = 1080, 1920
 
-    # 3) Burn word-synced subtitles + hook title.
+    # 2) Apply source-timed B-roll before captions so subtitles stay visible.
     final_source = vertical_path
+    local_broll = []
+    for suggestion in broll_suggestions or []:
+        source_start = float(suggestion.get("timestamp", 0.0))
+        source_end = source_start + float(suggestion.get("duration", 3.0))
+        if source_start < end_seconds and source_end > start_seconds:
+            local_broll.append({
+                **suggestion,
+                "timestamp": max(0.0, source_start - start_seconds),
+                "duration": min(source_end, end_seconds) - max(source_start, start_seconds),
+            })
+    if local_broll:
+        overlaid = temp_dir / f"broll_{clip_index + 1}_{suffix}.mp4"
+        if overlay_broll(vertical_path, local_broll, overlaid):
+            final_source = overlaid
+
+    # 3) Burn word-synced subtitles + hook title.
     if options.get("add_subtitles", True):
         ass_path = temp_dir / f"subs_{clip_index + 1}_{suffix}.ass"
         built = build_ass_subtitles(
@@ -160,17 +177,16 @@ def _render_clip_sync(
             font_size=options.get("font_size"),
             font_color=options.get("font_color"),
             caption_template=options.get("caption_template", "default"),
-            keep_ranges=[(0.0, end_seconds - start_seconds)],
+            keep_ranges=[(start_seconds, end_seconds)],
             hook_title=segment.get("hook_title"),
             include_captions=True,
         )
         if built:
             captioned_path = temp_dir / f"cap_{clip_index + 1}_{suffix}.mp4"
-            fonts_dir = ass_path.parent  # subtitles filter reads fontsdir
             from .font_registry import FONTS_DIR
 
             if burn_ass_subtitles_ffmpeg(
-                vertical_path, ass_path, captioned_path, FONTS_DIR
+                final_source, ass_path, captioned_path, FONTS_DIR
             ):
                 final_source = captioned_path
 
@@ -211,6 +227,8 @@ async def process_video(
             await progress_cb(progress, message, status)
 
     try:
+        if config.transcription_provider == "assemblyai" and not config.assembly_ai_api_key:
+            raise RuntimeError("Add ASSEMBLY_AI_API_KEY to backend/.env to enable AssemblyAI transcription.")
         if source_type is None:
             source_type = determine_source_type(url_or_path)
 
@@ -243,7 +261,7 @@ async def process_video(
             transcript, include_broll=include_broll
         )
         segments = [_segment_to_payload(s) for s in analysis.most_relevant_segments]
-        segments = segments[: config.max_clips]
+        segments = segments[: min(7, config.max_clips)]
         if not segments:
             raise RuntimeError("AI analysis selected no clip-worthy segments")
 
@@ -257,6 +275,7 @@ async def process_video(
             )
 
         total = len(segments)
+        rendered_count = 0
         for index, segment in enumerate(segments):
             progress = 70 + int(25 * (index / max(1, total)))
             await emit(progress, f"Rendering clip {index + 1}/{total}...")
@@ -268,22 +287,10 @@ async def process_video(
                 output_dir,
                 temp_dir,
                 options,
+                broll_suggestions,
             )
             if not rendered:
                 continue
-
-            # Optional B-roll overlay (best-effort, never fails the pipeline).
-            if broll_suggestions:
-                overlaid = temp_dir / f"broll_{index + 1}_{uuid.uuid4().hex[:8]}.mp4"
-                if await _run(
-                    overlay_broll,
-                    Path(rendered["file_path"]),
-                    broll_suggestions,
-                    overlaid,
-                ):
-                    import shutil
-
-                    shutil.copyfile(overlaid, rendered["file_path"])
 
             jobstore.add_clip(
                 job_id=job_id,
@@ -304,9 +311,12 @@ async def process_video(
                 hook_title=segment.get("hook_title"),
                 clip_order=index,
             )
+            rendered_count += 1
 
         # --- 100%: done --------------------------------------------------
-        await emit(100, "Processing complete", jobstore.STATUS_COMPLETED)
+        if rendered_count == 0:
+            raise RuntimeError("No clips could be rendered. Check the backend logs and try again.")
+        await emit(100, f"{rendered_count} clips ready to download", jobstore.STATUS_COMPLETED)
     except Exception as exc:
         logger.error("Pipeline failed for job %s: %s", job_id, exc)
         jobstore.set_job_error(job_id, str(exc))

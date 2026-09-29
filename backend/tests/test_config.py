@@ -4,6 +4,8 @@ import app.config as config_module
 
 
 def _fresh_config(monkeypatch, env):
+    # Do not reload the user's real credentials or local settings into tests.
+    monkeypatch.setattr("dotenv.load_dotenv", lambda: None)
     # Clear all relevant vars first so the host environment cannot leak in.
     for key in [
         "OPENAI_API_KEY",
@@ -34,7 +36,7 @@ def _fresh_config(monkeypatch, env):
 def test_defaults(monkeypatch):
     cfg = _fresh_config(monkeypatch, {})
     assert cfg.whisper_model == "base"
-    assert cfg.transcription_provider == "whisper"
+    assert cfg.transcription_provider == "assemblyai"
     assert cfg.output_dir == "data/outputs"
     assert cfg.temp_dir == "data/temp"
     assert cfg.max_clips == 7
@@ -42,16 +44,14 @@ def test_defaults(monkeypatch):
     assert cfg.cors_origins == ["http://localhost:3000"]
 
 
-def test_default_llm_is_real_gemini_id(monkeypatch):
+def test_default_llm_uses_current_gemini_model(monkeypatch):
     cfg = _fresh_config(monkeypatch, {})
-    assert cfg.llm == "google-gla:gemini-1.5-flash"
-    # The reference project's fictional id must never be used.
-    assert "gemini-3-flash-preview" not in cfg.llm
+    assert cfg.llm == "google-gla:gemini-3.8-flash"
 
 
 def test_llm_inferred_from_google_key(monkeypatch):
     cfg = _fresh_config(monkeypatch, {"GOOGLE_API_KEY": "gkey"})
-    assert cfg.llm == "google-gla:gemini-1.5-flash"
+    assert cfg.llm == "google-gla:gemini-3.8-flash"
 
 
 def test_llm_inferred_from_openai_key(monkeypatch):
@@ -77,7 +77,7 @@ def test_transcription_provider_normalization(monkeypatch):
     )
     assert (
         _fresh_config(monkeypatch, {"TRANSCRIPTION_PROVIDER": "garbage"}).transcription_provider
-        == "whisper"
+        == "assemblyai"
     )
 
 

@@ -17,8 +17,9 @@ import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 # --- Status constants ---------------------------------------------------------
 
@@ -81,11 +82,16 @@ class Job:
 # --- Connection helpers -------------------------------------------------------
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(_db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_store(db_path: str | Path | None = None) -> None:

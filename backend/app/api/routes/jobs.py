@@ -133,6 +133,10 @@ def _normalize_options(raw: Any) -> dict[str, Any]:
     if output_format in ("vertical", "original"):
         options["output_format"] = output_format
 
+    transition = raw.get("transition")
+    if transition in ("none", "fade"):
+        options["transition"] = transition
+
     options["include_broll"] = bool(raw.get("include_broll", False))
     options["add_subtitles"] = bool(raw.get("add_subtitles", True))
 

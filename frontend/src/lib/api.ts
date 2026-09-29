@@ -79,6 +79,7 @@ export interface JobOptions {
   include_broll?: boolean;
   output_format?: OutputFormat;
   add_subtitles?: boolean;
+  transition?: "none" | "fade";
   transcription_provider?: string;
 }
 

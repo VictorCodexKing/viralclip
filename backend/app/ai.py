@@ -5,9 +5,8 @@ Adapted from the reference ``ai.py``. The pydantic output schema
 ``BRollOpportunity``), the system prompt, the hook-title sanitizer, and the
 segment-bound repair logic are kept faithful to the reference.
 
-The one deliberate change: the default model id is a **real** Gemini id
-(see ``config.DEFAULT_LLM``); the reference's placeholder/fictional ids are not
-used. Multi-provider dispatch is retained via pydantic-ai so the user can pick
+The default model id is configured in ``config.DEFAULT_LLM``.
+Multi-provider dispatch is retained via pydantic-ai so the user can pick
 Gemini, GPT, Claude, or a local Ollama model.
 """
 
@@ -21,16 +20,17 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models import Model
 
 from .config import Config, get_config
 
 logger = logging.getLogger("viralclip.ai")
 
-IDEAL_CLIP_MIN_SECONDS = 25
-IDEAL_CLIP_MAX_SECONDS = 50
-MIN_ACCEPTED_CLIP_SECONDS = 15
-MAX_ACCEPTED_CLIP_SECONDS = 60
+IDEAL_CLIP_MIN_SECONDS = 20
+IDEAL_CLIP_MAX_SECONDS = 30
+MIN_ACCEPTED_CLIP_SECONDS = 10
+MAX_ACCEPTED_CLIP_SECONDS = 30
 HOOK_TITLE_MAX_CHARS = 64
 HOOK_TITLE_MAX_WORDS = 10
 
@@ -321,12 +321,12 @@ Identify 2-4 moments in each segment where B-roll footage could enhance the vide
 - Use simple, searchable keywords (e.g., "coffee shop", "laptop coding", "money stack")
 
 TIMING GUIDELINES:
-- Target 25-50 seconds for most clips
-- Use 15-24 seconds only when the moment is exceptionally dense, self-contained, and complete
-- CRITICAL: start_time MUST be different from end_time (minimum 15 seconds apart)
+- Target 20-30 seconds for most clips
+- Use 10-19 seconds only when the moment is exceptionally dense, self-contained, and complete
+- CRITICAL: start_time MUST be different from end_time (minimum 10 seconds apart)
 - Focus on natural content boundaries rather than arbitrary time limits
 - Include enough context for the segment to be understandable
-- Prefer roughly 30-50 seconds when possible
+- Never exceed 30 seconds; aim for a complete hook and payoff
 - Start at the hook or the minimum setup needed to make the hook land, and end after the payoff
 - If a highlight is only one good line, expand to include the surrounding setup and payoff rather than returning a tiny fragment
 - Stop expanding when the topic drifts, the speaker repeats the same point, or the clip loses momentum
@@ -335,8 +335,8 @@ TIMESTAMP REQUIREMENTS - EXTREMELY IMPORTANT:
 - Use EXACT timestamps as they appear in the transcript
 - Never modify timestamp format (keep MM:SS structure)
 - start_time MUST be LESS THAN end_time (start_time < end_time)
-- MINIMUM segment duration: 15 seconds (end_time - start_time >= 15 seconds)
-- IDEAL segment duration: 25-50 seconds
+- MINIMUM segment duration: 10 seconds (end_time - start_time >= 10 seconds)
+- IDEAL segment duration: 20-30 seconds; MAXIMUM: 30 seconds
 - Look at transcript ranges like [02:25 - 02:35] and use different start/end times
 - NEVER use the same timestamp for both start_time and end_time
 - Example: start_time: "02:25", end_time: "02:35" (NOT "02:25" and "02:25")
@@ -347,7 +347,7 @@ SCORING AND OUTPUT RULES:
 - virality_reasoning and reasoning should cite what is actually present in the chosen span
 - summary and key_topics must also stay grounded in the transcript and should not add outside interpretation
 
-Find 2-5 compelling segments that would work well as standalone clips. Quality over quantity: choose fewer stronger segments over filling a quota. Every selected segment must be accurate, self-contained, have proper time ranges, and score high on virality metrics."""
+Find 3-7 compelling segments that would work well as standalone clips. Quality over quantity: choose fewer stronger segments over filling a quota. Every selected segment must be accurate, self-contained, have proper time ranges, and score high on virality metrics."""
 
 
 # --- Provider dispatch --------------------------------------------------------
@@ -410,7 +410,7 @@ def _build_transcript_model(runtime_config: Config) -> Model:
     if not provider_model_name:
         raise RuntimeError(
             "Selected LLM is missing a model name. Use provider:model, "
-            "for example google-gla:gemini-1.5-flash."
+            "for example google-gla:gemini-3.8-flash."
         )
 
     if provider in {"google", "google-gla"}:
@@ -480,7 +480,7 @@ def get_transcript_agent() -> Agent[None, TranscriptAnalysis]:
             model=_build_transcript_model(runtime_config),
             output_type=TranscriptAnalysis,
             system_prompt=transcript_analysis_system_prompt,
-            output_retries=2,
+            retries=2,
         )
         _transcript_agent_signature = signature
     return _transcript_agent
@@ -518,10 +518,10 @@ Follow this workflow:
 4. For each chosen segment, use the earliest timestamp in the selected range as start_time and the latest timestamp in the selected range as end_time.{broll_instruction}
 
 Selection target:
-- Choose 2-5 segments total.
-- Most selected clips should be 25-50 seconds.
-- Only choose a 15-24 second clip when it already contains a full setup and payoff.
-- If a strong moment is shorter than 25 seconds, first try expanding to nearby contiguous transcript lines that add useful context.
+- Choose 3-7 segments total when the source contains enough distinct moments. For short or sparse sources, choose fewer rather than inventing content.
+- Every selected clip must be 10-30 seconds; target 20-30 seconds.
+- Only choose a 10-19 second clip when it already contains a full setup and payoff.
+- If a strong moment is shorter than 20 seconds, first try expanding to nearby contiguous transcript lines that add useful context.
 - Skip weak standalone picks: intros, sponsor reads, CTAs, contextless quotes, repeated points, vague setup, and answer fragments that require prior context.
 - Before returning a segment, ask whether a viewer would understand and care without seeing the rest of the source video.
 
@@ -802,13 +802,24 @@ async def get_most_relevant_parts_by_transcript(
     )
     try:
         agent = get_transcript_agent()
-        result = await agent.run(
-            build_transcript_analysis_prompt(
-                transcript=transcript,
-                include_broll=include_broll,
-                clip_signals=clip_signals,
-            )
+        prompt = build_transcript_analysis_prompt(
+            transcript=transcript,
+            include_broll=include_broll,
+            clip_signals=clip_signals,
         )
+        for attempt in range(4):
+            try:
+                result = await agent.run(prompt)
+                break
+            except ModelHTTPError as exc:
+                if exc.status_code not in (502, 503, 504) or attempt == 3:
+                    raise
+                delay = 2 ** (attempt + 1)
+                logger.warning(
+                    "AI service temporarily unavailable (%s); retrying in %ss",
+                    exc.status_code, delay,
+                )
+                await asyncio.sleep(delay)
         analysis = result.output
         validated_segments = _validate_segments(
             analysis.most_relevant_segments, transcript

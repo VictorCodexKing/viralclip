@@ -1,9 +1,7 @@
 """ffmpeg/ffprobe helpers for the video pipeline.
 
 Adapted from the reference ``media/ffmpeg.py``, trimmed to the helpers the local
-pipeline needs. Every command invokes ``ffmpeg``/``ffprobe`` from PATH (no
-hardcoded binary paths), matching the sandbox's static build at
-``/root/.local/bin``.
+pipeline needs. Every command invokes ``ffmpeg``/``ffprobe`` from PATH.
 """
 
 from __future__ import annotations
@@ -116,23 +114,16 @@ def ffprobe_duration(video_path: Path) -> float:
 
 def ffmpeg_escape_filter_path(path: Path) -> str:
     """Escape a path for use inside an ffmpeg filter argument."""
-    return (
-        str(path)
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-        .replace(" ", "\\ ")
-    )
+    return ffmpeg_escape_filter_value(path.as_posix())
 
 
 def ffmpeg_escape_filter_value(value: str) -> str:
-    """Escape an ffmpeg filter option value."""
-    return (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-        .replace(" ", "\\ ")
+    """Escape both the option parser and filtergraph parser, without a shell."""
+    option_value = "".join(
+        "\\" + char if char in "\\': \t\r\n" else char for char in str(value)
+    )
+    return "".join(
+        "\\" + char if char in "\\'[],; \t\r\n" else char for char in option_value
     )
 
 
@@ -179,7 +170,7 @@ def subtitles_filter_fragment(
     """ffmpeg ``subtitles`` filter fragment burning an ASS file (with fonts dir)."""
     fragment = f"subtitles=filename={ffmpeg_escape_filter_path(ass_path)}"
     if fonts_dir:
-        fragment += f":fontsdir={ffmpeg_escape_filter_value(str(fonts_dir))}"
+        fragment += f":fontsdir={ffmpeg_escape_filter_path(fonts_dir)}"
     return fragment
 
 

@@ -2,9 +2,11 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { toast } from "sonner";
 import {
   AlertTriangle,
   ArrowLeft,
+  Bell,
   CheckCircle2,
   Clapperboard,
   Loader2,
@@ -27,6 +29,55 @@ export function JobView({ jobId }: { jobId: string }) {
   const [message, setMessage] = React.useState("Starting…");
   const [error, setError] = React.useState<string | null>(null);
   const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [notificationPermission, setNotificationPermission] = React.useState<NotificationPermission | null>(null);
+  const notifiedJobs = React.useRef(new Set<string>());
+
+  React.useEffect(() => {
+    if ("Notification" in window) setNotificationPermission(Notification.permission);
+  }, []);
+
+  async function enableNotifications() {
+    try {
+      const permission = await Notification.requestPermission();
+      setNotificationPermission(permission);
+      if (permission === "granted") {
+        toast.success("We'll notify you when your clips are ready.");
+      } else {
+        toast.info("You will still see a ready alert on this page.");
+      }
+    } catch {
+      toast.info("Desktop notifications aren't available. We'll show the ready alert here.");
+    }
+  }
+
+  React.useEffect(() => {
+    if (job?.id !== jobId || job.status !== "completed" || job.clips.length === 0) return;
+    if (notifiedJobs.current.has(jobId)) return;
+    notifiedJobs.current.add(jobId);
+    const storageKey = `viralclip:ready:${jobId}`;
+    try {
+      if (sessionStorage.getItem(storageKey)) return;
+      sessionStorage.setItem(storageKey, "1");
+    } catch {
+      // The in-memory guard still prevents repeats when storage is unavailable.
+    }
+    const description = `${job.clips.length} ${job.clips.length === 1 ? "clip is" : "clips are"} ready to preview and download.`;
+    toast.success("Your clips are ready!", { id: storageKey, description, duration: 10000 });
+    if ("Notification" in window && Notification.permission === "granted") {
+      try {
+        const notification = new Notification("ViralClip: your clips are ready!", {
+          body: description,
+          tag: storageKey,
+        });
+        notification.onclick = () => {
+          window.focus();
+          notification.close();
+        };
+      } catch {
+        // A browser may restrict desktop alerts; the in-page toast remains.
+      }
+    }
+  }, [job, jobId]);
 
   const refreshJob = React.useCallback(async () => {
     try {
@@ -34,6 +85,8 @@ export function JobView({ jobId }: { jobId: string }) {
       setJob(data);
       setStatus(data.status);
       setProgress(data.progress);
+      if (data.progress_message) setMessage(data.progress_message);
+      setLoadError(null);
       if (data.error) setError(data.error);
       return data;
     } catch (err) {
@@ -46,6 +99,11 @@ export function JobView({ jobId }: { jobId: string }) {
 
   React.useEffect(() => {
     let cancelled = false;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+    const stopPolling = () => {
+      if (pollTimer !== undefined) clearInterval(pollTimer);
+    };
 
     // Load the initial snapshot, then subscribe to live progress unless the
     // job is already finished.
@@ -53,18 +111,30 @@ export function JobView({ jobId }: { jobId: string }) {
       if (cancelled || !data) return;
       if (data.status === "completed" || data.status === "error") return;
 
+      // A snapshot fallback catches completion even if an SSE connection drops.
+      pollTimer = setInterval(() => {
+        refreshJob().then((snapshot) => {
+          if (snapshot?.status === "completed" || snapshot?.status === "error") stopPolling();
+        });
+      }, 5000);
+
       const sub = subscribeProgress(jobId, {
         onProgress: (event) => {
+          if (cancelled) return;
           setStatus(event.status);
           if (event.progress != null) setProgress(event.progress);
           if (event.message) setMessage(event.message);
         },
         onClose: (finalStatus) => {
+          if (cancelled) return;
           setStatus(finalStatus);
           // Fetch the final job so clips (or the error) are available.
-          refreshJob();
+          refreshJob().then((snapshot) => {
+            if (snapshot?.status === "completed" || snapshot?.status === "error") stopPolling();
+          });
         },
         onError: () => {
+          if (cancelled) return;
           // On transport error, fall back to a one-off refresh.
           refreshJob();
         },
@@ -75,6 +145,7 @@ export function JobView({ jobId }: { jobId: string }) {
 
     return () => {
       cancelled = true;
+      stopPolling();
       subRef.current?.close();
     };
   }, [jobId, refreshJob]);
@@ -114,6 +185,23 @@ export function JobView({ jobId }: { jobId: string }) {
             <h1 className="text-lg font-semibold">Processing your video</h1>
           </div>
           <Progress value={progress} />
+          {notificationPermission !== null ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="self-start"
+              onClick={enableNotifications}
+              disabled={notificationPermission !== "default"}
+            >
+              <Bell className="size-4" />
+              {notificationPermission === "granted"
+                ? "Desktop notification enabled"
+                : notificationPermission === "denied"
+                  ? "Ready alert will appear on this page"
+                  : "Notify me when ready"}
+            </Button>
+          ) : null}
           <div className="flex items-center justify-between text-sm text-muted-foreground">
             <span>{message}</span>
             <span className="tabular-nums">{Math.round(progress)}%</span>

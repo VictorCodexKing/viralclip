@@ -1,10 +1,7 @@
 """Transcription helpers for the video pipeline.
 
-Adapted from the reference ``media/transcription.py``. Defaults to **local
-Whisper** with word-level timestamps so no AssemblyAI key is required. The
-AssemblyAI provider is used only when ``ASSEMBLY_AI_API_KEY`` is set (and
-``TRANSCRIPTION_PROVIDER=assemblyai``); a YouTube-captions provider is also
-available for plain-text transcripts.
+Adapted from the reference ``media/transcription.py``. Defaults to **AssemblyAI** word-level timestamps. Set ``ASSEMBLY_AI_API_KEY``
+in backend/.env. Local Whisper and YouTube captions remain optional providers.
 
 All providers normalise into the transcript-cache sidecar
 ``{version, words:[{text,start,end,confidence,speaker}], utterances, text}``
@@ -18,6 +15,7 @@ import json
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from ..config import get_config
@@ -33,14 +31,6 @@ from .common import (
     logger,
 )
 from .ffmpeg import run_ffmpeg_command
-
-try:  # optional local backend; only required for the whisper provider
-    import whisper as _whisper
-
-    _WHISPER_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    _whisper = None
-    _WHISPER_AVAILABLE = False
 
 _WHISPER_MODEL_CACHE: Dict[str, Any] = {}
 
@@ -89,13 +79,13 @@ def _prepare_audio_for_transcription(video_path: Path) -> Path:
 
 def _get_whisper_model(model_name: str = "base"):
     """Load and cache a Whisper model by name."""
-    if not _WHISPER_AVAILABLE:
-        raise RuntimeError(
-            "Whisper is not installed. Install it with: uv add openai-whisper"
-        )
     if model_name not in _WHISPER_MODEL_CACHE:
+        try:
+            import whisper
+        except ImportError as exc:
+            raise RuntimeError("Whisper is not installed. Run uv sync.") from exc
         logger.info("Loading Whisper model: %s", model_name)
-        _WHISPER_MODEL_CACHE[model_name] = _whisper.load_model(model_name)
+        _WHISPER_MODEL_CACHE[model_name] = whisper.load_model(model_name)
     return _WHISPER_MODEL_CACHE[model_name]
 
 
@@ -234,6 +224,8 @@ def _transcribe_with_assemblyai(video_path: Path, runtime_config) -> Any:
     aai.settings.api_key = runtime_config.assembly_ai_api_key
     transcriber = aai.Transcriber()
     config_obj = aai.TranscriptionConfig(
+        speech_models=["universal-3-pro", "universal-2"],
+        language_detection=True,
         speaker_labels=True,
         punctuate=True,
         format_text=True,
@@ -256,13 +248,21 @@ def get_video_transcript(
 ) -> str:
     """Get a video transcript using the configured provider.
 
-    Dispatches to local Whisper (default), AssemblyAI, or YouTube captions based
+    Dispatches to AssemblyAI (default), local Whisper, or YouTube captions based
     on ``TRANSCRIPTION_PROVIDER``. ``source_url`` enables the youtube_captions
     provider, which needs the original URL rather than a local file path.
     """
     logger.info("Getting transcript for: %s", video_path)
     runtime_config = get_config()
     provider = runtime_config.transcription_provider
+
+    cached = load_cached_transcript_data(video_path)
+    if cached and cached.get("provider") == provider and cached.get("words"):
+        words = [SimpleNamespace(**word) for word in cached["words"]]
+        lines = _format_words_for_analysis(words)
+        if lines:
+            logger.info("Using cached %s transcript: %d segments", provider, len(lines))
+            return "\n".join(lines)
 
     if provider == "youtube_captions":
         if not source_url:
@@ -283,7 +283,7 @@ def get_video_transcript(
             )
         transcript_obj = _transcribe_with_assemblyai(video_path, runtime_config)
         formatted_lines = format_transcript_for_analysis(transcript_obj)
-        cache_transcript_data(video_path, transcript_obj)
+        cache_transcript_data(video_path, transcript_obj, provider="assemblyai")
         result = "\n".join(formatted_lines)
         logger.info("AssemblyAI transcript: %d segments", len(formatted_lines))
         return result
@@ -292,7 +292,7 @@ def get_video_transcript(
     model_name = runtime_config.whisper_model
     whisper_result = transcribe_with_whisper(video_path, model_name)
     formatted_lines = format_transcript_for_analysis(whisper_result)
-    cache_transcript_data(video_path, whisper_result)
+    cache_transcript_data(video_path, whisper_result, provider="whisper")
     result = "\n".join(formatted_lines)
     logger.info("Whisper transcript: %d segments", len(formatted_lines))
     return result
@@ -323,7 +323,7 @@ def _serialize_transcript_word(word) -> Dict[str, Any]:
     }
 
 
-def cache_transcript_data(video_path: Path, transcript) -> None:
+def cache_transcript_data(video_path: Path, transcript, *, provider: str | None = None) -> None:
     """Cache transcript word timings for subtitle generation.
 
     Handles both AssemblyAI transcript objects and Whisper result dicts.
@@ -332,7 +332,8 @@ def cache_transcript_data(video_path: Path, transcript) -> None:
 
     if isinstance(transcript, dict):
         cache_data = _whisper_result_to_transcript_data(transcript)
-        with open(cache_path, "w") as f:
+        cache_data["provider"] = provider or "whisper"
+        with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache_data, f)
         logger.info("Cached %d words to %s", len(cache_data["words"]), cache_path)
         return
@@ -359,11 +360,12 @@ def cache_transcript_data(video_path: Path, transcript) -> None:
 
     cache_data = {
         "version": TRANSCRIPT_CACHE_SCHEMA_VERSION,
+        "provider": provider or "assemblyai",
         "words": words_data,
         "utterances": utterances_data,
         "text": transcript.text,
     }
-    with open(cache_path, "w") as f:
+    with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(cache_data, f)
     logger.info("Cached %d words to %s", len(words_data), cache_path)
 
@@ -374,7 +376,7 @@ def load_cached_transcript_data(video_path: Path) -> Optional[Dict]:
     if not cache_path.exists():
         return None
     try:
-        with open(cache_path, "r") as f:
+        with open(cache_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
             if "version" not in payload:
                 payload["version"] = TRANSCRIPT_CACHE_SCHEMA_VERSION

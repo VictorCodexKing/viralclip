@@ -22,3 +22,7 @@ frontend/out/
 .cache/
 **/whisper_cache/
 *.pt
+
+# Local browser verification artifacts
+.playwright-cli/
+output/playwright/

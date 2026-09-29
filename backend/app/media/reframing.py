@@ -1,9 +1,9 @@
 """Face-centered 9:16 reframing for the video pipeline.
 
 Adapted (and simplified) from the reference ``media/reframing.py``. It samples a
-few frames, runs MediaPipe face detection (preferred) with an OpenCV Haar
+few frames, runs MediaPipe face detection (preferred) with OpenCV DNN and Haar
 cascade fallback, and computes a weighted crop centre biased slightly upward for
-better face framing. When no faces are found -- or when neither detector is
+better face framing. When no faces are found -- or when no detector is
 available -- it degrades cleanly to a **center crop**. Everything is CPU-only.
 """
 
@@ -21,6 +21,8 @@ from .ffmpeg import (
     round_to_even,
     run_ffmpeg_command,
 )
+
+MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 
 try:  # opencv is required for face detection; degrade gracefully if missing
     import cv2
@@ -74,26 +76,96 @@ def _center_crop_offsets(
 
 
 def _open_face_detectors():
-    """Initialise the MediaPipe (preferred) + Haar (fallback) face detectors."""
+    """Initialise MediaPipe, OpenCV DNN, and Haar in fallback order."""
     mp_face = None
     try:
         import mediapipe as mp
 
-        mp_face = mp.solutions.face_detection.FaceDetection(
-            model_selection=1, min_detection_confidence=0.5
-        )
+        if hasattr(mp, "solutions"):
+            mp_face = mp.solutions.face_detection.FaceDetection(
+                model_selection=1, min_detection_confidence=0.5
+            )
+        else:
+            mp_face = mp.tasks.vision.FaceDetector.create_from_options(
+                mp.tasks.vision.FaceDetectorOptions(
+                    base_options=mp.tasks.BaseOptions(model_asset_path=str(MODELS_DIR / "blaze_face_short_range.tflite")),
+                    min_detection_confidence=0.5,
+                )
+            )
     except Exception as exc:  # ImportError or runtime init failure
-        logger.info("MediaPipe unavailable (%s); using OpenCV Haar only", exc)
+        logger.info("MediaPipe unavailable (%s); trying OpenCV detectors", exc)
 
+    dnn = None
     haar = None
     if _CV2_AVAILABLE:
+        try:
+            yunet = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
+            prototxt = MODELS_DIR / "deploy.prototxt"
+            weights = MODELS_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
+            if yunet.is_file() and hasattr(cv2, "FaceDetectorYN"):
+                dnn = cv2.FaceDetectorYN.create(str(yunet), "", (320, 320), 0.5)
+            elif prototxt.is_file() and weights.is_file() and hasattr(cv2.dnn, "readNetFromCaffe"):
+                dnn = cv2.dnn.readNetFromCaffe(str(prototxt), str(weights))
+        except Exception as exc:
+            logger.info("OpenCV DNN unavailable (%s); trying Haar", exc)
         try:
             haar = cv2.CascadeClassifier(
                 cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
             )
         except Exception as exc:  # pragma: no cover
             logger.info("Haar cascade unavailable (%s)", exc)
-    return mp_face, haar
+    return mp_face, dnn, haar
+
+
+def _mediapipe_faces(detector, frame_bgr):
+    height, width = frame_bgr.shape[:2]
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    faces = []
+    if hasattr(detector, "process"):
+        results = detector.process(rgb)
+        for detection in results.detections or []:
+            box = detection.location_data.relative_bounding_box
+            fw, fh = box.width * width, box.height * height
+            if fw > 20 and fh > 20:
+                faces.append((int((box.xmin + box.width / 2) * width), int((box.ymin + box.height / 2) * height), int(fw * fh), float(detection.score[0])))
+    else:
+        import mediapipe as mp
+
+        results = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+        for detection in results.detections or []:
+            box = detection.bounding_box
+            if box.width > 20 and box.height > 20:
+                faces.append((box.origin_x + box.width // 2, box.origin_y + box.height // 2, box.width * box.height, float(detection.categories[0].score)))
+    return faces
+
+
+def _dnn_faces(detector, frame_bgr):
+    height, width = frame_bgr.shape[:2]
+    if hasattr(detector, "setInputSize"):
+        detector.setInputSize((width, height))
+        _, detections = detector.detect(frame_bgr)
+        if detections is None:
+            return []
+        return [
+            (int(left + fw / 2), int(top + fh / 2), int(fw * fh), float(row[-1]))
+            for row in detections
+            for left, top, fw, fh in [row[:4]]
+            if fw > 20 and fh > 20
+        ]
+    detector.setInput(cv2.dnn.blobFromImage(frame_bgr, 1.0, (300, 300), (104, 177, 123)))
+    results = detector.forward()
+    faces = []
+    for detection in results[0, 0]:
+        confidence = float(detection[2])
+        if confidence < 0.5:
+            continue
+        left, top, right, bottom = detection[3:7] * np.array([width, height, width, height])
+        left, right = max(0, int(left)), min(width, int(right))
+        top, bottom = max(0, int(top)), min(height, int(bottom))
+        fw, fh = right - left, bottom - top
+        if fw > 20 and fh > 20:
+            faces.append((left + fw // 2, top + fh // 2, fw * fh, confidence))
+    return faces
 
 
 def detect_faces_in_clip(
@@ -108,8 +180,8 @@ def detect_faces_in_clip(
         logger.info("OpenCV/NumPy unavailable; skipping face detection")
         return []
 
-    mp_face, haar = _open_face_detectors()
-    if mp_face is None and haar is None:
+    mp_face, dnn, haar = _open_face_detectors()
+    if mp_face is None and dnn is None and haar is None:
         return []
 
     face_centers: List[Tuple[int, int, int, float]] = []
@@ -140,21 +212,15 @@ def detect_faces_in_clip(
 
             if mp_face is not None:
                 try:
-                    results = mp_face.process(
-                        cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    )
-                    if results.detections:
-                        for det in results.detections:
-                            box = det.location_data.relative_bounding_box
-                            fw = max(0.0, box.width) * width
-                            fh = max(0.0, box.height) * height
-                            conf = float(det.score[0]) if det.score else 0.5
-                            cx = int((box.xmin + box.width / 2) * width)
-                            cy = int((box.ymin + box.height / 2) * height)
-                            if fw > 20 and fh > 20:
-                                detected.append((cx, cy, int(fw * fh), conf))
+                    detected = _mediapipe_faces(mp_face, frame_bgr)
                 except Exception as exc:
                     logger.warning("MediaPipe detection failed: %s", exc)
+
+            if not detected and dnn is not None:
+                try:
+                    detected = _dnn_faces(dnn, frame_bgr)
+                except Exception as exc:
+                    logger.warning("OpenCV DNN detection failed: %s", exc)
 
             if not detected and haar is not None:
                 try:

@@ -42,8 +42,13 @@ All configuration is read from environment variables (a `.env` file at the backe
 root is loaded automatically). See `app/config.py` for the full list. The most common:
 
 - `GOOGLE_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` — LLM provider keys
-- `LLM` — model id (default `google-gla:gemini-1.5-flash`)
-- `ASSEMBLY_AI_API_KEY` — optional AssemblyAI transcription
+- `LLM` — model id (default `google-gla:gemini-3.8-flash`)
+- `ASSEMBLY_AI_API_KEY` — required for default AssemblyAI transcription
 - `PEXELS_API_KEY` — optional B-roll
 - `WHISPER_MODEL` — local Whisper model size (default `base`)
-- `TRANSCRIPTION_PROVIDER` — `whisper` | `assemblyai` | `youtube_captions`
+- `TRANSCRIPTION_PROVIDER` — `assemblyai` (default) | `whisper` | `youtube_captions`
+
+Clip rendering uses MoviePy 2 for 10–30 second cuts, face-centered 1080×1920
+cropping, and optional fades. FFmpeg burns the cached word-synced captions and
+handles optional B-roll. Clips are written to `data/outputs` for local download.
+Install optional face detector assets with `uv run python scripts/download_face_models.py`.

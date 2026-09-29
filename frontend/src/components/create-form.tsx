@@ -51,6 +51,7 @@ export function CreateForm() {
   const [outputFormat, setOutputFormat] =
     React.useState<OutputFormat>("vertical");
   const [addSubtitles, setAddSubtitles] = React.useState(true);
+  const [transition, setTransition] = React.useState<"none" | "fade">("none");
 
   React.useEffect(() => {
     let cancelled = false;
@@ -116,6 +117,7 @@ export function CreateForm() {
       include_broll: includeBroll,
       output_format: outputFormat,
       add_subtitles: addSubtitles,
+      transition,
     };
 
     setSubmitting(true);
@@ -299,6 +301,17 @@ export function CreateForm() {
             <SelectContent>
               <SelectItem value="vertical">Vertical 9:16</SelectItem>
               <SelectItem value="original">Original aspect</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <Label>Transition effect</Label>
+          <Select value={transition} onValueChange={(value) => setTransition(value as "none" | "fade")}>
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">None</SelectItem>
+              <SelectItem value="fade">Fade in/out</SelectItem>
             </SelectContent>
           </Select>
         </div>

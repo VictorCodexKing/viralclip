@@ -17,9 +17,8 @@ _config_override: "Config | None" = None
 
 LOCAL_OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
-# Real, currently-available default Gemini id (env ``LLM`` overrides it). The
-# reference project shipped placeholder model ids that are not used here.
-DEFAULT_LLM = "google-gla:gemini-1.5-flash"
+# Default Gemini model (env ``LLM`` overrides it).
+DEFAULT_LLM = "google-gla:gemini-3.8-flash"
 
 
 class Config:
@@ -38,7 +37,7 @@ class Config:
             os.getenv("WHISPER_MODEL") or os.getenv("WHISPER_MODEL_SIZE") or "base"
         )
         self.transcription_provider = self._normalize_transcription_provider(
-            os.getenv("TRANSCRIPTION_PROVIDER", "whisper")
+            os.getenv("TRANSCRIPTION_PROVIDER", "assemblyai")
         )
 
         # --- B-roll ---
@@ -81,7 +80,7 @@ class Config:
         normalized = (value or "").strip().lower().replace("-", "_")
         if normalized in ("whisper", "assemblyai", "youtube_captions"):
             return normalized
-        return "whisper"
+        return "assemblyai"
 
     def resolve_ollama_base_url(self) -> str:
         return self.ollama_base_url or LOCAL_OLLAMA_BASE_URL

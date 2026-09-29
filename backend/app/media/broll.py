@@ -178,7 +178,7 @@ def overlay_broll(
         if not local_path or not Path(local_path).exists():
             continue
         start = max(0.0, min(float(sug.get("timestamp", 0.0)), clip_duration - 0.5))
-        dur = max(1.0, min(float(sug.get("duration", 3.0)), clip_duration - start))
+        dur = max(0.05, min(float(sug.get("duration", 3.0)), clip_duration - start))
         end = start + dur
         in_idx = valid + 1
         inputs += ["-i", local_path]
@@ -186,7 +186,7 @@ def overlay_broll(
         out = f"ov{idx}"
         filters.append(
             f"[{in_idx}:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-            f"crop=1080:1920,setsar=1,trim=duration={dur:.3f},setpts=PTS-STARTPTS[{scaled}]"
+            f"crop=1080:1920,setsar=1,trim=duration={dur:.3f},setpts=PTS-STARTPTS+{start:.3f}/TB[{scaled}]"
         )
         filters.append(
             f"[{last_label}][{scaled}]overlay=enable='between(t,{start:.3f},{end:.3f})'[{out}]"

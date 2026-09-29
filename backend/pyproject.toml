@@ -8,7 +8,7 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "pydantic",
-    "pydantic-ai",
+    "pydantic-ai>=2,<3",
     "python-dotenv",
     "yt-dlp",
     "openai-whisper",
@@ -21,6 +21,7 @@ dependencies = [
     "sse-starlette",
     "requests",
     "pillow",
+    "moviepy>=2.2,<3",
 ]
 
 [dependency-groups]
